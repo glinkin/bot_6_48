@@ -9,6 +9,7 @@ from config import settings
 from db.database import init_db
 from bot.middleware import DatabaseMiddleware
 from bot.handlers import start, ticket, create_ticket
+from services.draw_sync import draw_sync_worker
 
 
 # Configure logging
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 async def main():
     """Initialize and start the bot."""
+    logger.info("Starting lottery bot...")
+    logger.info(f"API Base URL: {settings.api_base_url}")
+    logger.info(f"Database: {settings.database_url.split('@')[1] if '@' in settings.database_url else 'local'}")
+    
     # Initialize bot and dispatcher
     bot = Bot(
         token=settings.telegram_bot_token,
@@ -36,16 +41,24 @@ async def main():
     dp.include_router(start.router)
     dp.include_router(create_ticket.router)
     dp.include_router(ticket.router)
+    logger.info("Handlers registered")
     
     # Initialize database
     logger.info("Initializing database...")
     await init_db()
+    logger.info("Database initialized successfully")
+    
+    # Start background draw synchronizer
+    logger.info("Starting draw synchronizer...")
+    sync_task = asyncio.create_task(draw_sync_worker(interval=300))  # Sync every 5 minutes
+    logger.info("Draw synchronizer started")
     
     # Start polling
-    logger.info("Starting bot...")
+    logger.info("Bot started successfully! Polling for updates...")
     try:
         await dp.start_polling(bot)
     finally:
+        sync_task.cancel()
         await bot.session.close()
 
 

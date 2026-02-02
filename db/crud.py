@@ -92,6 +92,58 @@ async def get_ticket_by_id(session: AsyncSession, ticket_id: int) -> Ticket | No
     return result.scalar_one_or_none()
 
 
+async def update_user_from_api_data(
+    session: AsyncSession,
+    user: User,
+    api_data: dict
+) -> User:
+    """
+    Update user with data from API.
+    
+    Args:
+        session: Database session
+        user: User object to update
+        api_data: Customer data from API
+    
+    Returns:
+        Updated user object
+    """
+    from datetime import datetime
+    import json
+    
+    # Update fields from API data
+    user.external_id = str(api_data.get("id")) if api_data.get("id") else None
+    user.name = api_data.get("name")
+    user.email = api_data.get("email")
+    
+    # Convert balance to float
+    balance = api_data.get("balance")
+    if balance is not None:
+        user.balance = float(balance)
+    
+    # Parse birthday string to date
+    birthday_str = api_data.get("birthday")
+    if birthday_str:
+        try:
+            user.birthday = datetime.strptime(birthday_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+    
+    user.sex = api_data.get("sex")
+    user.available_tickets = api_data.get("available_tickets", 0)
+    
+    # Store additional_fields as JSON string
+    additional_fields = api_data.get("additional_fields")
+    if additional_fields:
+        user.additional_fields = json.dumps(additional_fields)
+    
+    user.updated_at = datetime.utcnow()
+    
+    await session.commit()
+    await session.refresh(user)
+    return user
+
+
 async def update_ticket_numbers(
     session: AsyncSession, 
     ticket_id: int, 

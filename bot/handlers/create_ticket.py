@@ -1,4 +1,5 @@
 """Handler for managing ticket numbers (not creating tickets)."""
+import logging
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -7,9 +8,13 @@ from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import messages, keyboards
-from db.crud import get_user_by_telegram_id, get_user_tickets_for_draw, update_ticket_numbers, get_ticket_by_id
-from services.draw_service import get_current_draw_id, generate_random_numbers, validate_numbers, parse_numbers_from_text
+from db.crud import get_user_by_telegram_id
+from services.draw_service import generate_random_numbers, validate_numbers, parse_numbers_from_text
+from api.client import api_client
+from db.crud_tickets import sync_user_tickets_from_api
+from db.crud_draws import get_current_draw
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
@@ -34,46 +39,55 @@ async def select_ticket_numbers(message: Message, session: AsyncSession, state: 
         )
         return
     
-    # Get user's tickets for current draw
-    current_draw = get_current_draw_id()
-    tickets = await get_user_tickets_for_draw(session, user.id, current_draw)
-    
-    if not tickets:
+    # Check if user is linked to external customer
+    if not user.external_id:
         await message.answer(
-            "❌ У вас нет билетов на текущий розыгрыш!\n\n"
-            "Билеты начисляются за участие в маркетинговых акциях.",
+            "❌ Ваш аккаунт не связан с системой акции.\n\n"
+            "Пожалуйста, используйте /start для регистрации.",
             reply_markup=keyboards.get_main_keyboard()
         )
         return
     
-    # Filter tickets without numbers
-    tickets_without_numbers = [t for t in tickets if t.numbers is None]
-    
-    if not tickets_without_numbers:
-        await message.answer(
-            "✅ Для всех билетов уже выбраны числа!",
-            reply_markup=keyboards.get_main_keyboard()
-        )
-        return
-    
-    # If only one ticket without numbers, select it directly
-    if len(tickets_without_numbers) == 1:
+    # Get customer tickets from API
+    try:
+        customer_id = int(user.external_id)
+        tickets = await api_client.get_customer_tickets(customer_id)
+        
+        if tickets is None:
+            await message.answer(
+                "❌ Не удалось получить данные о ваучерах.\n"
+                "Попробуйте позже.",
+                reply_markup=keyboards.get_main_keyboard()
+            )
+            return
+        
+        # Check available_tickets count
+        available_count = user.available_tickets or 0
+        
+        if available_count == 0:
+            await message.answer(
+                "❌ У вас нет доступных ваучеров для заполнения!\n\n"
+                "Ваучеры начисляются за участие в маркетинговых акциях Termoland.",
+                reply_markup=keyboards.get_main_keyboard()
+            )
+            return
+        
+        # If no existing tickets but have available_tickets, API will create on fill
+        # Show number selection (API auto-creates and fills ticket)
         await state.set_state(NumberSelection.choosing_method)
-        await state.update_data(ticket_id=tickets_without_numbers[0].id)
+        await state.update_data(customer_id=customer_id)
         await message.answer(
-            f"🎯 Выбор чисел для билета #{tickets_without_numbers[0].id}\n\n"
-            "Выберите способ:",
+            f"🎯 У вас {available_count} доступных ваучеров для заполнения\n\n"
+            "Выберите способ заполнения:",
             reply_markup=keyboards.get_number_selection_keyboard()
         )
-        return
-    
-    # Show list of tickets to choose from
-    await state.set_state(NumberSelection.selecting_ticket)
-    await message.answer(
-        f"У вас {len(tickets_without_numbers)} билетов без чисел.\n"
-        "Выберите билет для назначения чисел:",
-        reply_markup=keyboards.get_ticket_selection_keyboard(tickets_without_numbers)
-    )
+        
+    except Exception as e:
+        logger.error(f"Error getting tickets for user {telegram_id}: {e}", exc_info=True)
+        await message.answer(
+            "❌ Произошла ошибка при получении ваучеров.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
 
 
 @router.callback_query(F.data.startswith("ticket_"), NumberSelection.selecting_ticket)
@@ -82,12 +96,14 @@ async def ticket_selected(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     
     ticket_id = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    customer_id = data.get("customer_id")
     
     await state.set_state(NumberSelection.choosing_method)
-    await state.update_data(ticket_id=ticket_id)
+    await state.update_data(ticket_id=ticket_id, customer_id=customer_id)
     
     await callback.message.edit_text(
-        f"🎯 Выбор чисел для билета #{ticket_id}\n\n"
+        f"🎯 Выбор чисел для ваучера #{ticket_id}\n\n"
         "Выберите способ:",
         reply_markup=keyboards.get_number_selection_keyboard()
     )
@@ -99,24 +115,93 @@ async def auto_generate_numbers(callback: CallbackQuery, session: AsyncSession, 
     await callback.answer()
     
     data = await state.get_data()
-    ticket_id = data.get("ticket_id")
+    customer_id = data.get("customer_id")
     
+    # Get current draw
+    current_draw = await get_current_draw(session)
+    if not current_draw:
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ Нет активной акции.",
+            reply_markup=None
+        )
+        await callback.message.answer(
+            "Попробуйте позже.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
+        return
+    
+    draw_id = int(current_draw.external_id)
+    
+    # Generate random numbers
     numbers = generate_random_numbers()
     
-    # Update ticket with auto-generated numbers
-    await update_ticket_numbers(session, ticket_id, numbers)
-    
-    await state.clear()
-    await callback.message.edit_text(
-        messages.NUMBERS_ASSIGNED_TEMPLATE.format(
-            numbers=messages.format_numbers(numbers)
-        ),
-        reply_markup=None
-    )
-    await callback.message.answer(
-        "✅ Числа успешно назначены!",
-        reply_markup=keyboards.get_main_keyboard()
-    )
+    # Fill ticket via API (API auto-selects first unfilled ticket)
+    try:
+        filled_ticket = await api_client.fill_ticket(customer_id, draw_id, numbers)
+        
+        if filled_ticket:
+            # Update available_tickets count
+            telegram_id = callback.from_user.id
+            user = await get_user_by_telegram_id(session, telegram_id)
+            if user:
+                # Decrease available tickets count
+                if user.available_tickets and user.available_tickets > 0:
+                    user.available_tickets -= 1
+                    session.add(user)
+                    await session.commit()
+                
+                # Sync filled ticket to local database
+                await sync_user_tickets_from_api(
+                    session,
+                    user.id,
+                    customer_id,
+                    [filled_ticket]  # Sync only this filled ticket
+                )
+            
+            await state.clear()
+            await callback.message.edit_text(
+                messages.NUMBERS_ASSIGNED_TEMPLATE.format(
+                    numbers=messages.format_numbers(numbers)
+                ),
+                reply_markup=None
+            )
+            
+            # Check if user has more unfilled tickets
+            remaining_tickets = user.available_tickets if user and user.available_tickets else 0
+            
+            if remaining_tickets > 0:
+                await callback.message.answer(
+                    f"✅ Числа успешно назначены!\n\n📝 У вас осталось <b>{remaining_tickets}</b> незаполненных ваучеров.\n💡 Хотите заполнить еще?",
+                    reply_markup=keyboards.get_fill_another_keyboard()
+                )
+            else:
+                await callback.message.answer(
+                    "✅ Числа успешно назначены!",
+                    reply_markup=keyboards.get_main_keyboard()
+                )
+        else:
+            await state.clear()
+            await callback.message.edit_text(
+                "❌ Не удалось назначить числа для ваучера.\n"
+                "Возможно, все ваучеры уже заполнены.",
+                reply_markup=None
+            )
+            await callback.message.answer(
+                "Попробуйте ещё раз или обратитесь в поддержку.",
+                reply_markup=keyboards.get_main_keyboard()
+            )
+    except Exception as e:
+        logger.error(f"Error filling ticket for customer {customer_id}: {e}", exc_info=True)
+        await state.clear()
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при назначении чисел.",
+            reply_markup=None
+        )
+        await callback.message.answer(
+            "Попробуйте позже.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
 
 
 @router.callback_query(F.data == "manual_numbers", NumberSelection.choosing_method)
@@ -147,19 +232,70 @@ async def process_manual_numbers(message: Message, session: AsyncSession, state:
         await message.answer(f"❌ {error}\nПопробуйте еще раз.")
         return
     
-    # Update ticket with user numbers
+    # Sort numbers for consistency
+    sorted_numbers = sorted(numbers)
+    
+    # Get current draw
+    current_draw = await get_current_draw(session)
+    if not current_draw:
+        await state.clear()
+        await message.answer(
+            "❌ Нет активной акции.\n"
+            "Попробуйте позже.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
+        return
+    
+    draw_id = int(current_draw.external_id)
+    
+    # Fill ticket via API (API auto-selects first unfilled ticket)
     data = await state.get_data()
-    ticket_id = data.get("ticket_id")
+    customer_id = data.get("customer_id")
     
-    await update_ticket_numbers(session, ticket_id, sorted(numbers))
-    
-    await state.clear()
-    await message.answer(
-        messages.NUMBERS_ASSIGNED_TEMPLATE.format(
-            numbers=messages.format_numbers(sorted(numbers))
-        ),
-        reply_markup=keyboards.get_main_keyboard()
-    )
+    try:
+        filled_ticket = await api_client.fill_ticket(customer_id, draw_id, sorted_numbers)
+        
+        if filled_ticket:
+            # Update available_tickets count
+            telegram_id = message.from_user.id
+            user = await get_user_by_telegram_id(session, telegram_id)
+            if user:
+                # Decrease available tickets count
+                if user.available_tickets and user.available_tickets > 0:
+                    user.available_tickets -= 1
+                    session.add(user)
+                    await session.commit()
+                
+                # Sync filled ticket to local database
+                await sync_user_tickets_from_api(
+                    session,
+                    user.id,
+                    customer_id,
+                    [filled_ticket]  # Sync only this filled ticket
+                )
+            
+            await state.clear()
+            await message.answer(
+                messages.NUMBERS_ASSIGNED_TEMPLATE.format(
+                    numbers=messages.format_numbers(sorted_numbers)
+                ),
+                reply_markup=keyboards.get_main_keyboard()
+            )
+        else:
+            await state.clear()
+            await message.answer(
+                "❌ Не удалось назначить числа для ваучера.\n"
+                "Возможно, все ваучеры уже заполнены.",
+                reply_markup=keyboards.get_main_keyboard()
+            )
+    except Exception as e:
+        logger.error(f"Error filling ticket for customer {customer_id} with manual numbers: {e}", exc_info=True)
+        await state.clear()
+        await message.answer(
+            "❌ Произошла ошибка при назначении чисел.\n"
+            "Попробуйте позже.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
 
 
 @router.callback_query(F.data == "cancel_selection")
@@ -169,10 +305,33 @@ async def cancel_selection(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "❌ Выбор чисел отменён.\n\n"
-        "Числа будут автоматически сгенерированы при старте розыгрыша.",
+        "Числа будут автоматически сгенерированы при старте акции.",
         reply_markup=None
     )
     await callback.message.answer(
         "Главное меню",
         reply_markup=keyboards.get_main_keyboard()
     )
+
+
+@router.callback_query(F.data == "fill_another_ticket")
+async def fill_another_ticket(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    """Handle request to fill another ticket."""
+    await callback.answer()
+    await callback.message.delete()
+    
+    # Reuse the main handler
+    await select_ticket_numbers(callback.message, session, state)
+
+
+@router.callback_query(F.data == "show_my_tickets")
+async def show_my_tickets_callback(callback: CallbackQuery, session: AsyncSession):
+    """Handle show my tickets callback."""
+    await callback.answer()
+    await callback.message.delete()
+    
+    # Import here to avoid circular dependency
+    from bot.handlers.ticket import show_my_tickets
+    
+    # Reuse the handler
+    await show_my_tickets(callback.message, session)

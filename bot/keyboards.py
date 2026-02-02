@@ -19,9 +19,10 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
     """Get main menu keyboard."""
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🎫 Мои билеты")],
+            [KeyboardButton(text="🎫 Мои ваучеры")],
             [KeyboardButton(text="🎯 Выбрать числа")],
-            [KeyboardButton(text="🏆 Результаты розыгрыша")]
+            [KeyboardButton(text="🏆 Результаты акции")],
+            [KeyboardButton(text="❓ Частые вопросы")]
         ],
         resize_keyboard=True
     )
@@ -32,9 +33,11 @@ def get_ticket_selection_keyboard(tickets) -> InlineKeyboardMarkup:
     """Get keyboard for selecting which ticket to assign numbers to."""
     buttons = []
     for ticket in tickets:
+        # Handle both DB models and API dicts
+        ticket_id = ticket.id if hasattr(ticket, 'id') else ticket.get('id')
         buttons.append([InlineKeyboardButton(
-            text=f"Билет #{ticket.id}",
-            callback_data=f"ticket_{ticket.id}"
+            text=f"Ваучер #{ticket_id}",
+            callback_data=f"ticket_{ticket_id}"
         )])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_selection")])
     
@@ -58,6 +61,17 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_selection")]
+        ]
+    )
+    return keyboard
+
+
+def get_fill_another_keyboard() -> InlineKeyboardMarkup:
+    """Get keyboard with option to fill another ticket."""
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Заполнить еще ваучер", callback_data="fill_another_ticket")],
+            [InlineKeyboardButton(text="🎫 Мои ваучеры", callback_data="show_my_tickets")]
         ]
     )
     return keyboard
