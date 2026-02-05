@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
 from bot import messages, keyboards
-from services.user_service import get_user_phone_number
+from services.user_service import get_user_phone_number, sync_user_data_from_api
 from services.ticket_checker import check_ticket_result
 from services.draw_service import get_current_draw_id
 from services.ticket_sync import get_user_tickets_with_sync
@@ -38,6 +38,13 @@ async def show_my_tickets(message: Message, session: AsyncSession):
     
     # Show loading message
     loading_msg = await message.answer("⏳ Загрузка ваучеров...")
+    
+    # Sync user data from API to get latest available_tickets count
+    await sync_user_data_from_api(session, telegram_id, api_client)
+    
+    # Refresh user object to get updated data
+    user = await get_user_by_telegram_id(session, telegram_id)
+    logger.info(f"After sync: available_tickets={user.available_tickets}, external_id={user.external_id}")
     
     # Get current draw
     current_draw_obj = await get_current_draw(session)

@@ -61,7 +61,19 @@ async def create_or_update_ticket(
         # Update existing ticket
         ticket.customer_id = api_data.get("customer_id")
         ticket.draw_id = api_data.get("draw_id")
-        ticket.numbers = api_data.get("numbers")
+        # Convert numbers from API format (object or array)
+        numbers = api_data.get("numbers")
+        if numbers:
+            # If numbers is a dict/object like {"1": false, "2": false}, extract keys
+            if isinstance(numbers, dict):
+                ticket.numbers = sorted([int(k) for k in numbers.keys()])
+            # If numbers is array of strings, convert to ints
+            elif isinstance(numbers, list):
+                ticket.numbers = [int(n) for n in numbers]
+            else:
+                ticket.numbers = None
+        else:
+            ticket.numbers = None
         ticket.is_winner = api_data.get("is_winner", False)
         ticket.matched_count = api_data.get("matched_count", 0)
         ticket.prize_amount = float(api_data.get("prize_amount", 0))
@@ -81,17 +93,28 @@ async def create_or_update_ticket(
         ticket.updated_at = datetime.utcnow()
     else:
         # Create new ticket
+        # Convert numbers from API format (object or array)
+        numbers = api_data.get("numbers")
+        numbers_int = None
+        if numbers:
+            # If numbers is a dict/object like {"1": false, "2": false}, extract keys
+            if isinstance(numbers, dict):
+                numbers_int = sorted([int(k) for k in numbers.keys()])
+            # If numbers is array of strings, convert to ints
+            elif isinstance(numbers, list):
+                numbers_int = [int(n) for n in numbers]
+        
         ticket = Ticket(
             external_id=external_id,
             user_id=user_id,
             customer_id=api_data.get("customer_id"),
             draw_id=api_data.get("draw_id"),
-            numbers=api_data.get("numbers"),
+            numbers=numbers_int,
             is_winner=api_data.get("is_winner", False),
             matched_count=api_data.get("matched_count", 0),
             prize_amount=float(api_data.get("prize_amount", 0)),
             filled_by=api_data.get("filled_by"),
-            status="active" if api_data.get("numbers") else "pending"
+            status="active" if numbers_int else "pending"
         )
         
         # Parse filled_at

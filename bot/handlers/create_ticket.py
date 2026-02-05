@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot import messages, keyboards
 from db.crud import get_user_by_telegram_id
 from services.draw_service import generate_random_numbers, validate_numbers, parse_numbers_from_text
+from services.user_service import sync_user_data_from_api
 from api.client import api_client
 from db.crud_tickets import sync_user_tickets_from_api
 from db.crud_draws import get_current_draw
@@ -318,10 +319,69 @@ async def cancel_selection(callback: CallbackQuery, state: FSMContext):
 async def fill_another_ticket(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
     """Handle request to fill another ticket."""
     await callback.answer()
-    await callback.message.delete()
     
-    # Reuse the main handler
-    await select_ticket_numbers(callback.message, session, state)
+    telegram_id = callback.from_user.id
+    user = await get_user_by_telegram_id(session, telegram_id)
+    
+    if not user:
+        await callback.message.edit_text(
+            messages.REQUEST_PHONE_MESSAGE,
+            reply_markup=keyboards.get_phone_keyboard()
+        )
+        return
+    
+    # Sync user data from API to get latest available_tickets count
+    await sync_user_data_from_api(session, telegram_id, api_client)
+    
+    # Refresh user object to get updated data
+    user = await get_user_by_telegram_id(session, telegram_id)
+    
+    # Check if user is linked to external customer
+    if not user.external_id:
+        await callback.message.edit_text(
+            "❌ Ваш аккаунт не связан с системой акции.\n\n"
+            "Пожалуйста, используйте /start для регистрации.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
+        return
+    
+    # Get customer tickets from API
+    try:
+        customer_id = int(user.external_id)
+        
+        # Check available_tickets count
+        available_count = user.available_tickets or 0
+        
+        if available_count == 0:
+            await callback.message.edit_text(
+                "❌ У вас не осталось доступных ваучеров для заполнения!",
+                reply_markup=None
+            )
+            await callback.message.answer(
+                "Ваучеры начисляются за участие в маркетинговых акциях Termoland.",
+                reply_markup=keyboards.get_main_keyboard()
+            )
+            return
+        
+        # Show number selection
+        await state.set_state(NumberSelection.choosing_method)
+        await state.update_data(customer_id=customer_id)
+        await callback.message.edit_text(
+            f"🎯 У вас {available_count} доступных ваучеров для заполнения\n\n"
+            "Выберите способ заполнения:",
+            reply_markup=keyboards.get_number_selection_keyboard()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting tickets for user {telegram_id}: {e}", exc_info=True)
+        await callback.message.edit_text(
+            "❌ Произошла ошибка при получении ваучеров.",
+            reply_markup=None
+        )
+        await callback.message.answer(
+            "Попробуйте позже.",
+            reply_markup=keyboards.get_main_keyboard()
+        )
 
 
 @router.callback_query(F.data == "show_my_tickets")
